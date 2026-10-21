@@ -1,0 +1,326 @@
+name: RDP
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+concurrency:
+group: rdp-state
+cancel-in-progress: false
+
+jobs:
+secure-rdp:
+runs-on: windows-11-arm
+timeout-minutes: 360
+
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
+
+  - name: Show Windows and Hardware Information
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Continue"
+
+      Write-Host "========================================"
+      Write-Host " WINDOWS ARM64 REMOTE DESKTOP"
+      Write-Host "========================================"
+
+      Get-CimInstance Win32_OperatingSystem |
+        Select-Object Caption, Version, BuildNumber, OSArchitecture, TotalVisibleMemorySize, FreePhysicalMemory |
+        Format-List
+
+      Get-CimInstance Win32_Processor |
+        Select-Object Name, NumberOfCores, NumberOfLogicalProcessors |
+        Format-List
+
+  - name: Windows Updates - Check for Updates
+    shell: powershell
+    continue-on-error: true
+    run: |
+      $ErrorActionPreference = "Continue"
+
+      $service = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+
+      if ($service) {
+          try {
+              Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+
+              $uso = "$env:SystemRoot\System32\UsoClient.exe"
+
+              if (Test-Path $uso) {
+                  Start-Process -FilePath $uso -ArgumentList "StartScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
+              }
+
+              Write-Host "Windows Update scan requested."
+          }
+          catch {
+              Write-Host "Windows Update could not start: $($_.Exception.Message)"
+          }
+      }
+      else {
+          Write-Host "Windows Update service is unavailable."
+      }
+
+  - name: Create or Configure Windows User Rafael
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $username = "Rafael"
+      $plainPassword = "yysst"
+      $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+
+      $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+      if ($null -eq $user) {
+          New-LocalUser -Name $username -Password $securePassword -FullName "Rafael" -Description "Remote Desktop User" -PasswordNeverExpires -AccountNeverExpires
+      }
+      else {
+          Set-LocalUser -Name $username -Password $securePassword -PasswordNeverExpires $true
+          Enable-LocalUser -Name $username
+      }
+
+      foreach ($group in @("Administrators", "Remote Desktop Users")) {
+          try {
+              Add-LocalGroupMember -Group $group -Member $username -ErrorAction Stop
+          }
+          catch {
+              Write-Host "$username may already belong to $group."
+          }
+      }
+
+      Write-Host "Windows account configured: Rafael"
+
+  - name: Enable Remote Desktop
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+
+      Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
+
+      Set-Service -Name TermService -StartupType Automatic
+      Start-Service -Name TermService
+
+      Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
+        Enable-NetFirewallRule
+
+      Write-Host "Remote Desktop enabled."
+
+  - name: Restrict RDP Firewall to Tailscale Addresses
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $ruleName = "RDP-Tailscale-Only"
+
+      Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule
+
+      New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress "100.64.0.0/10" -Profile Any
+
+      Write-Host "Created Tailscale RDP firewall rule."
+
+  - name: Install Tailscale ARM64
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+      $ProgressPreference = "SilentlyContinue"
+
+      $installerPath = Join-Path $env:TEMP "tailscale-setup-arm64.msi"
+      $logPath = Join-Path $env:TEMP "tailscale-install.log"
+      $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi"
+
+      Write-Host "Downloading official Tailscale ARM64 installer..."
+
+      Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath
+
+      $arguments = "/i `"$installerPath`" /qn /norestart /L*v `"$logPath`""
+
+      $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+
+      if ($process.ExitCode -notin @(0, 3010)) {
+          if (Test-Path $logPath) {
+              Get-Content $logPath -Tail 60
+          }
+
+          throw "Tailscale installation failed: $($process.ExitCode)"
+      }
+
+      $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+      if (-not (Test-Path $tsExe)) {
+          throw "Tailscale executable not found."
+      }
+
+      & $tsExe version
+
+  - name: Authenticate and Verify Tailscale
+    shell: powershell
+    timeout-minutes: 12
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+      if (-not (Test-Path $tsExe)) {
+          throw "Tailscale executable not found."
+      }
+
+      $service = Get-Service -Name Tailscale -ErrorAction Stop
+
+      if ($service.Status -ne "Running") {
+          Start-Service -Name Tailscale
+      }
+
+      function Get-TailscaleIPv4 {
+          $output = & $tsExe ip -4 2>$null
+          $code = $LASTEXITCODE
+
+          if ($code -ne 0) {
+              return $null
+          }
+
+          foreach ($line in $output) {
+              $address = "$line".Trim()
+
+              if ($address -match '^100\.' -and $address -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                  return $address
+              }
+          }
+
+          return $null
+      }
+
+      $ip = Get-TailscaleIPv4
+
+      if ($ip) {
+          Write-Host "Tailscale is already connected."
+          Write-Host "Tailscale IPv4: $ip"
+          & $tsExe status
+          exit 0
+      }
+
+      Write-Host "Starting Tailscale authentication..."
+
+      $stdoutFile = Join-Path $env:TEMP "tailscale-up-out.txt"
+      $stderrFile = Join-Path $env:TEMP "tailscale-up-err.txt"
+
+      Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue
+      Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+
+      $upProcess = Start-Process -FilePath $tsExe -ArgumentList "up" -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+
+      $deadline = (Get-Date).AddMinutes(10)
+      $printedUrls = @()
+
+      while ((Get-Date) -lt $deadline) {
+          foreach ($file in @($stdoutFile, $stderrFile)) {
+              if (Test-Path $file) {
+                  $content = Get-Content $file -Raw -ErrorAction SilentlyContinue
+
+                  if ($content) {
+                      $urlMatches = [regex]::Matches($content, 'https://login\.tailscale\.com/[^\s"''<>]+')
+
+                      foreach ($item in $urlMatches) {
+                          $url = $item.Value.TrimEnd('.', ',', ')', ';')
+
+                          if ($url -notin $printedUrls) {
+                              $printedUrls += $url
+                              Write-Host "Tailscale login link:"
+                              Write-Host $url
+                          }
+                      }
+                  }
+              }
+          }
+
+          $ip = Get-TailscaleIPv4
+
+          if ($ip) {
+              Write-Host "Tailscale connection confirmed."
+              Write-Host "Tailscale IPv4: $ip"
+              & $tsExe status
+              exit 0
+          }
+
+          Start-Sleep -Seconds 5
+      }
+
+      Write-Host "Authentication was not confirmed within 10 minutes."
+
+      if (Test-Path $stdoutFile) {
+          Get-Content $stdoutFile -Tail 50
+      }
+
+      if (Test-Path $stderrFile) {
+          Get-Content $stderrFile -Tail 50
+      }
+
+      & $tsExe status
+      throw "Tailscale is not connected. Authorize this runner using the displayed login link or use an official authentication method."
+
+  - name: Verify RDP and Tailscale
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+      $service = Get-Service -Name TermService
+
+      if ($service.Status -ne "Running") {
+          Start-Service -Name TermService
+      }
+
+      $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+
+      if ($listener) {
+          Write-Host "RDP listening on TCP 3389."
+      }
+      else {
+          Write-Host "Warning: RDP listener not detected."
+      }
+
+      Write-Host "Tailscale status:"
+      & $tsExe status
+
+      Write-Host "Tailscale IPv4:"
+      & $tsExe ip -4
+
+      Write-Host "Windows username: Rafael"
+
+  - name: Keep RDP Session Alive
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Continue"
+
+      $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+      Write-Host "Keeping the session alive."
+
+      while ($true) {
+          $rdp = Get-Service -Name TermService -ErrorAction SilentlyContinue
+
+          if ($rdp -and $rdp.Status -ne "Running") {
+              Start-Service -Name TermService -ErrorAction SilentlyContinue
+          }
+
+          $ts = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+          if ($ts -and $ts.Status -ne "Running") {
+              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Health check: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+          if (Test-Path $tsExe) {
+              & $tsExe status
+          }
+
+          Start-Sleep -Seconds 60
+      }
